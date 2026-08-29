@@ -40,6 +40,7 @@ from cosmos_policy._src.predict2.models.text2world_model import (
 from cosmos_policy.conditioner import Text2WorldCondition
 from cosmos_policy.modules.cosmos_sampler import CosmosPolicySampler
 from cosmos_policy.modules.hybrid_edm_sde import HybridEDMSDE
+from cosmos_policy.structured_l21 import StructuredL21Regularizer, apply_structured_l21
 
 
 def replace_latent_with_action_chunk(
@@ -208,8 +209,17 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     # (Must be an integer - or will be cast to an integer later!)
     action_loss_multiplier: int = 1
 
+    # Structured input-channel L2,1 regularization. All components are opt-in
+    # so existing Cosmos Policy experiments retain their original behavior.
+    structured_l21_lambda: float = 0.0
+    enable_sa_input_channel_l21: bool = False
+    enable_ca_query_input_channel_l21: bool = False
+    enable_mlp_input_channel_l21: bool = False
+    structured_l21_diagnostic_metrics: bool = False
+
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
+        assert self.structured_l21_lambda >= 0, "structured_l21_lambda must be non-negative"
         assert not (
             self.mask_loss_for_action_future_state_prediction and self.mask_value_prediction_loss_for_policy_prediction
         ), (
@@ -232,6 +242,12 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
     def __init__(self, config: CosmosPolicyModelConfig):
         super().__init__(config)
         self.config: CosmosPolicyModelConfig = config
+
+        self.structured_l21_regularizer = StructuredL21Regularizer(
+            enable_self_attention=config.enable_sa_input_channel_l21,
+            enable_cross_attention=config.enable_ca_query_input_channel_l21,
+            enable_mlp=config.enable_mlp_input_channel_l21,
+        )
 
         # Cosmos Policy SDE and Sampler
         self.sde = lazy_instantiate(config.sde)
@@ -304,6 +320,15 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             kendall_loss = kendall_loss.sum(dim=1).mean() * self.loss_scale
         else:
             raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
+
+        kendall_loss, structured_l21_metrics = apply_structured_l21(
+            kendall_loss,
+            self.net,
+            self.structured_l21_regularizer,
+            regularization_lambda=self.config.structured_l21_lambda,
+            collect_diagnostics=self.config.structured_l21_diagnostic_metrics,
+        )
+        output_batch.update(structured_l21_metrics)
 
         return output_batch, kendall_loss
 
