@@ -1046,6 +1046,22 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class SharedTokenLinear(nn.Linear):
+    """A token-wise shared linear map initialized to the identity.
+
+    The same ``D -> D`` map is applied to every spatial-temporal token after
+    patch embedding and before the first DiT block.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size, hidden_size, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.weight.copy_(torch.eye(self.out_features, device=self.weight.device, dtype=self.weight.dtype))
+
+
 class FinalLayer(nn.Module):
     """
     The final layer of video DiT.
@@ -1516,6 +1532,7 @@ class MiniTrainDIT(WeightTrainingStat):
         self.rope_enable_fps_modulation = rope_enable_fps_modulation
         self.extra_image_context_dim = extra_image_context_dim
         self.build_patch_embed()
+        self.shared_token_linear = SharedTokenLinear(model_channels)
         self.build_pos_embed()
         self.use_adaln_lora = use_adaln_lora
         self.adaln_lora_dim = adaln_lora_dim
@@ -1580,6 +1597,7 @@ class MiniTrainDIT(WeightTrainingStat):
 
     def init_weights(self):
         self.x_embedder.init_weights()
+        self.shared_token_linear.reset_parameters()
         self.pos_embedder.reset_parameters()
         if self.extra_per_block_abs_pos_emb:
             self.extra_pos_embedder.reset_parameters()
@@ -1688,6 +1706,7 @@ class MiniTrainDIT(WeightTrainingStat):
                 [x_B_C_T_H_W, padding_mask.unsqueeze(1).repeat(1, 1, x_B_C_T_H_W.shape[2], 1, 1)], dim=1
             )
         x_B_T_H_W_D = self.x_embedder(x_B_C_T_H_W)
+        x_B_T_H_W_D = self.shared_token_linear(x_B_T_H_W_D)
 
         if self.extra_per_block_abs_pos_emb:
             extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D, fps=fps)
