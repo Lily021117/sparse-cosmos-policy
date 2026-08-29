@@ -342,18 +342,21 @@ class WandbCallback(WandBCallbackImage):
                         "sample_counter": getattr(self.trainer, "sample_counter", iteration),
                     }
                 )
-                structured_l21_metric_names = (
-                    "structured_l21_mlp_penalty",
-                    "structured_l21_mlp_group_norm_mean",
-                    "structured_l21_mlp_group_norm_std",
-                    "structured_l21_mlp_group_norm_min",
-                    "structured_l21_mlp_group_norm_max",
+                structured_l21_components = ("self_attention", "cross_attention", "mlp")
+                structured_l21_statistics = (
+                    "penalty",
+                    "group_norm_mean",
+                    "group_norm_std",
+                    "group_norm_min",
+                    "group_norm_max",
                 )
-                for metric_name in structured_l21_metric_names:
-                    if metric_name in output_batch:
-                        info[f"train{self.wandb_extra_tag}/{metric_name}"] = (
-                            output_batch[metric_name].detach().float().item()
-                        )
+                for component in structured_l21_components:
+                    for statistic in structured_l21_statistics:
+                        metric_name = f"structured_l21_{component}_{statistic}"
+                        if metric_name in output_batch:
+                            info[f"train{self.wandb_extra_tag}/{metric_name}"] = (
+                                output_batch[metric_name].detach().float().item()
+                            )
                 if self.save_s3:
                     if (
                         iteration

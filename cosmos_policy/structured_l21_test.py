@@ -148,12 +148,39 @@ def test_zero_lambda_integration_skips_real_dit_scan_and_preserves_task_loss(mon
     assert model.blocks[0].cross_attn.q_proj.weight.grad is None
 
 
-def test_positive_lambda_integrates_mlp_l21_on_real_dit():
+@pytest.mark.parametrize(
+    ("regularizer_kwargs", "enabled_components"),
+    [
+        ({"enable_self_attention": True}, {SELF_ATTENTION}),
+        ({"enable_cross_attention": True}, {CROSS_ATTENTION}),
+        ({"enable_mlp": True}, {MLP}),
+        (
+            {
+                "enable_self_attention": True,
+                "enable_cross_attention": True,
+                "enable_mlp": True,
+            },
+            {SELF_ATTENTION, CROSS_ATTENTION, MLP},
+        ),
+    ],
+)
+def test_positive_lambda_integrates_enabled_components_on_real_dit(
+    regularizer_kwargs,
+    enabled_components,
+):
     model = _tiny_dit()
-    regularizer = StructuredL21Regularizer(enable_mlp=True)
+    regularizer = StructuredL21Regularizer(**regularizer_kwargs)
     task_parameter = nn.Parameter(torch.tensor(2.0))
     task_loss = task_parameter.square()
     regularization_lambda = 0.25
+
+    result = regularizer(model)
+    assert set(result.group_norms) == enabled_components
+    assert set(result.penalties) == enabled_components
+    for component in enabled_components:
+        assert result.group_norms[component].shape == (model.model_channels,)
+        assert torch.isfinite(result.group_norms[component]).all()
+        assert torch.isfinite(result.penalties[component])
 
     total_loss, metrics = apply_structured_l21(
         task_loss,
@@ -161,16 +188,36 @@ def test_positive_lambda_integrates_mlp_l21_on_real_dit():
         regularizer,
         regularization_lambda=regularization_lambda,
     )
-    expected = task_loss.detach() + regularization_lambda * metrics["structured_l21_mlp_penalty"]
+    expected_penalty = sum(metrics[f"structured_l21_{component}_penalty"] for component in enabled_components)
+    expected = task_loss.detach() + regularization_lambda * expected_penalty
     torch.testing.assert_close(total_loss.detach(), expected)
     total_loss.backward()
 
-    mlp_grad = model.blocks[0].mlp.layer1.weight.grad
-    assert mlp_grad is not None
-    assert torch.isfinite(mlp_grad).all()
-    assert torch.count_nonzero(mlp_grad) == mlp_grad.numel()
-    assert model.blocks[0].self_attn.q_proj.weight.grad is None
-    assert model.blocks[0].cross_attn.q_proj.weight.grad is None
+    block = model.blocks[0]
+    component_weights = {
+        SELF_ATTENTION: (
+            block.self_attn.q_proj.weight,
+            block.self_attn.k_proj.weight,
+            block.self_attn.v_proj.weight,
+        ),
+        CROSS_ATTENTION: (block.cross_attn.q_proj.weight,),
+        MLP: (block.mlp.layer1.weight,),
+    }
+    for component, weights in component_weights.items():
+        for weight in weights:
+            if component in enabled_components:
+                assert weight.grad is not None
+                assert torch.isfinite(weight.grad).all()
+                assert torch.count_nonzero(weight.grad) > 0
+            else:
+                assert weight.grad is None
+
+    # These weights never belong to any of the configured input-channel groups.
+    assert block.self_attn.output_proj.weight.grad is None
+    assert block.cross_attn.k_proj.weight.grad is None
+    assert block.cross_attn.v_proj.weight.grad is None
+    assert block.cross_attn.output_proj.weight.grad is None
+    assert block.mlp.layer2.weight.grad is None
 
 
 def test_zero_lambda_explicit_diagnostics_collects_metrics_without_model_gradient():
