@@ -67,8 +67,21 @@ class StructuredL21Regularizer:
 
     @staticmethod
     def _dit_blocks(model: nn.Module) -> Iterable[nn.Module]:
+        seen_block_components: set[tuple[int, int, int]] = set()
         for module in model.modules():
             if all(hasattr(module, name) for name in ("self_attn", "cross_attn", "mlp")):
+                # Activation-checkpoint wrappers proxy these attributes from
+                # their wrapped block, so model.modules() visits two distinct
+                # module objects that describe the same logical DiT block.
+                # Deduplicate by the actual submodules used by the penalty.
+                block_components = (
+                    id(module.self_attn),
+                    id(module.cross_attn),
+                    id(module.mlp),
+                )
+                if block_components in seen_block_components:
+                    continue
+                seen_block_components.add(block_components)
                 yield module
 
     @staticmethod

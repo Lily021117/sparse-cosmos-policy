@@ -56,6 +56,46 @@ class _ToyDiT(nn.Module):
         self.blocks = nn.ModuleList([_ToyBlock() for _ in range(num_blocks)])
 
 
+class _CheckpointLikeWrapper(nn.Module):
+    """Expose the same block attributes as SAC's checkpoint wrapper."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._checkpoint_wrapped_module = module
+
+    @property
+    def self_attn(self) -> nn.Module:
+        return self._checkpoint_wrapped_module.self_attn
+
+    @property
+    def cross_attn(self) -> nn.Module:
+        return self._checkpoint_wrapped_module.cross_attn
+
+    @property
+    def mlp(self) -> nn.Module:
+        return self._checkpoint_wrapped_module.mlp
+
+
+def test_checkpoint_wrappers_do_not_duplicate_blocks_groups_or_penalty():
+    unwrapped = _ToyDiT(num_blocks=2)
+    for parameter in unwrapped.parameters():
+        nn.init.ones_(parameter)
+
+    wrapped = nn.Module()
+    wrapped.blocks = nn.ModuleList([_CheckpointLikeWrapper(block) for block in unwrapped.blocks])
+    # Also register a repeated reference to exercise module aliasing.
+    wrapped.repeated_block_reference = unwrapped.blocks[0]
+
+    regularizer = StructuredL21Regularizer(enable_mlp=True)
+    unwrapped_result = regularizer(unwrapped)
+    wrapped_result = regularizer(wrapped)
+
+    assert len(list(regularizer._dit_blocks(wrapped))) == 2
+    assert wrapped_result.group_norms[MLP].shape == (2 * 3,)
+    torch.testing.assert_close(wrapped_result.group_norms[MLP], unwrapped_result.group_norms[MLP])
+    torch.testing.assert_close(wrapped_result.penalties[MLP], unwrapped_result.penalties[MLP])
+
+
 def test_all_group_definitions_have_expected_counts_and_values():
     model = _ToyDiT(num_blocks=2)
     for parameter in model.parameters():
