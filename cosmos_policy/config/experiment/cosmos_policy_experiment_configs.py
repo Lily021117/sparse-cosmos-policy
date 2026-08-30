@@ -139,6 +139,12 @@ cosmos_predict2_2b_480p_libero = LazyDict(
                 resize_online=True,
                 resolution="224",
                 high_sigma_strategy="none",
+                net=dict(
+                    # Phase 2E fine-tunes the original DiT while retaining the
+                    # identity bridge exactly; future outer runs can disable
+                    # this flag and include it in their optimizer.
+                    freeze_shared_token_linear=True,
+                ),
                 # Phase 2B: only MLP input-channel L2,1 is enabled. Lambda zero
                 # skips all regularizer scans and preserves baseline compute.
                 structured_l21_lambda=0.0,

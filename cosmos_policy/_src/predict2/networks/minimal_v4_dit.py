@@ -1433,6 +1433,7 @@ class MiniTrainDIT(WeightTrainingStat):
         extra_h_extrapolation_ratio (float): Height extrapolation ratio for extra embeddings.
         extra_w_extrapolation_ratio (float): Width extrapolation ratio for extra embeddings.
         extra_t_extrapolation_ratio (float): Temporal extrapolation ratio for extra embeddings.
+        freeze_shared_token_linear (bool): Whether the identity token projection is excluded from training.
         n_dense_blocks (`int`, *optional*, defaults to -1):
             Number of blocks that will remain dense (not replaced with sparse attention)
             If -1, no blocks are replaced with sparse attention
@@ -1502,6 +1503,7 @@ class MiniTrainDIT(WeightTrainingStat):
         natten_parameters: Union[dict, list] = None,
         # if True, will closely match wan's strategy to use fp32 in certain layers/operations
         use_wan_fp32_strategy: bool = False,
+        freeze_shared_token_linear: bool = False,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1533,6 +1535,7 @@ class MiniTrainDIT(WeightTrainingStat):
         self.extra_image_context_dim = extra_image_context_dim
         self.build_patch_embed()
         self.shared_token_linear = SharedTokenLinear(model_channels)
+        self.shared_token_linear.requires_grad_(not freeze_shared_token_linear)
         self.build_pos_embed()
         self.use_adaln_lora = use_adaln_lora
         self.adaln_lora_dim = adaln_lora_dim

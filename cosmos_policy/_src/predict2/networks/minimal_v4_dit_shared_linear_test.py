@@ -1,5 +1,7 @@
+import pytest
 import torch
 
+from cosmos_policy._src.predict2.utils.optim_instantiate import get_regular_param_group
 from cosmos_policy._src.predict2.networks.minimal_v4_dit import (
     CheckpointMode,
     MiniTrainDIT,
@@ -8,7 +10,7 @@ from cosmos_policy._src.predict2.networks.minimal_v4_dit import (
 )
 
 
-def _tiny_dit() -> MiniTrainDIT:
+def _tiny_dit(*, freeze_shared_token_linear: bool = False) -> MiniTrainDIT:
     """Construct the smallest real MiniTrainDIT path needed before block 0."""
     return MiniTrainDIT(
         max_img_h=4,
@@ -29,6 +31,7 @@ def _tiny_dit() -> MiniTrainDIT:
         pos_emb_learnable=False,
         use_adaln_lora=False,
         sac_config=SACConfig(mode=CheckpointMode.NONE),
+        freeze_shared_token_linear=freeze_shared_token_linear,
     )
 
 
@@ -55,15 +58,35 @@ def test_shared_token_linear_identity_after_dtype_transfer():
     torch.testing.assert_close(output, tokens, rtol=0.0, atol=0.0)
 
 
-def test_shared_token_linear_receives_gradient():
+def test_shared_token_linear_architecture_parameter_receives_gradient():
     linear = SharedTokenLinear(8)
-    tokens = torch.randn(2, 3, 8)
+    tokens = torch.randn(2, 3, 8, requires_grad=True)
 
     linear(tokens).square().mean().backward()
 
+    assert linear.weight.requires_grad
     assert linear.weight.grad is not None
     assert torch.isfinite(linear.weight.grad).all()
     assert linear.weight.grad.abs().max() > 0
+    assert tokens.grad is not None
+    assert torch.isfinite(tokens.grad).all()
+    assert tokens.grad.abs().max() > 0
+
+
+@pytest.mark.parametrize("freeze_shared_token_linear", [False, True])
+def test_shared_token_linear_optimizer_membership_is_config_controlled(freeze_shared_token_linear):
+    model = _tiny_dit(freeze_shared_token_linear=freeze_shared_token_linear)
+    decay, no_decay = get_regular_param_group(model)
+    optimizer_parameters = {id(parameter) for parameter in decay + no_decay}
+
+    expected_trainable = not freeze_shared_token_linear
+    assert model.shared_token_linear.weight.requires_grad is expected_trainable
+    assert (id(model.shared_token_linear.weight) in optimizer_parameters) is expected_trainable
+    assert all(
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name != "shared_token_linear.weight"
+    )
 
 
 def test_shared_token_linear_is_identity_on_real_dit_pre_block_path():
