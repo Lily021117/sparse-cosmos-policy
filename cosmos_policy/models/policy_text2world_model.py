@@ -211,7 +211,13 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
 
     # Structured input-channel L2,1 regularization. All components are opt-in
     # so existing Cosmos Policy experiments retain their original behavior.
+    # ``structured_l21_lambda`` is retained as a backwards-compatible uniform
+    # coefficient for old experiment configs.  New experiments should use the
+    # component-specific coefficients below.
     structured_l21_lambda: float = 0.0
+    structured_l21_sa_lambda: float = 0.0
+    structured_l21_ca_lambda: float = 0.0
+    structured_l21_mlp_lambda: float = 0.0
     enable_sa_input_channel_l21: bool = False
     enable_ca_query_input_channel_l21: bool = False
     enable_mlp_input_channel_l21: bool = False
@@ -220,6 +226,20 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     def __attrs_post_init__(self):
         super().__attrs_post_init__()
         assert self.structured_l21_lambda >= 0, "structured_l21_lambda must be non-negative"
+        assert self.structured_l21_sa_lambda >= 0, "structured_l21_sa_lambda must be non-negative"
+        assert self.structured_l21_ca_lambda >= 0, "structured_l21_ca_lambda must be non-negative"
+        assert self.structured_l21_mlp_lambda >= 0, "structured_l21_mlp_lambda must be non-negative"
+        assert not (
+            self.structured_l21_lambda > 0
+            and any(
+                value > 0
+                for value in (
+                    self.structured_l21_sa_lambda,
+                    self.structured_l21_ca_lambda,
+                    self.structured_l21_mlp_lambda,
+                )
+            )
+        ), "Use either legacy structured_l21_lambda or component-specific structured L21 lambdas"
         assert not (
             self.mask_loss_for_action_future_state_prediction and self.mask_value_prediction_loss_for_policy_prediction
         ), (
@@ -252,6 +272,20 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         # Cosmos Policy SDE and Sampler
         self.sde = lazy_instantiate(config.sde)
         self.sampler = CosmosPolicySampler()
+
+    def _structured_l21_component_lambdas(self) -> dict[str, float]:
+        """Return the independent component coefficients for one loss call."""
+        if self.config.structured_l21_lambda > 0:
+            return {
+                "self_attention": self.config.structured_l21_lambda,
+                "cross_attention": self.config.structured_l21_lambda,
+                "mlp": self.config.structured_l21_lambda,
+            }
+        return {
+            "self_attention": self.config.structured_l21_sa_lambda,
+            "cross_attention": self.config.structured_l21_ca_lambda,
+            "mlp": self.config.structured_l21_mlp_lambda,
+        }
 
     def training_step(
         self, data_batch: dict[str, torch.Tensor], iteration: int
@@ -325,7 +359,7 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             kendall_loss,
             self.net,
             self.structured_l21_regularizer,
-            regularization_lambda=self.config.structured_l21_lambda,
+            component_lambdas=self._structured_l21_component_lambdas(),
             collect_diagnostics=self.config.structured_l21_diagnostic_metrics,
         )
         output_batch.update(structured_l21_metrics)

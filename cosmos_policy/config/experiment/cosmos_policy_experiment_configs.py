@@ -148,6 +148,9 @@ cosmos_predict2_2b_480p_libero = LazyDict(
                 # Phase 2B: only MLP input-channel L2,1 is enabled. Lambda zero
                 # skips all regularizer scans and preserves baseline compute.
                 structured_l21_lambda=0.0,
+                structured_l21_sa_lambda=0.0,
+                structured_l21_ca_lambda=0.0,
+                structured_l21_mlp_lambda=0.0,
                 enable_sa_input_channel_l21=False,
                 enable_ca_query_input_channel_l21=False,
                 enable_mlp_input_channel_l21=True,

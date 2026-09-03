@@ -280,6 +280,168 @@ def test_zero_lambda_explicit_diagnostics_collects_metrics_without_model_gradien
     assert model.blocks[0].mlp.layer1.weight.grad is None
 
 
+@pytest.mark.parametrize(
+    ("active_component", "component_lambdas", "expected_weight_names"),
+    [
+        (
+            SELF_ATTENTION,
+            {SELF_ATTENTION: 0.25, CROSS_ATTENTION: 0.0, MLP: 0.0},
+            ("q_proj", "k_proj", "v_proj"),
+        ),
+        (
+            CROSS_ATTENTION,
+            {SELF_ATTENTION: 0.0, CROSS_ATTENTION: 0.25, MLP: 0.0},
+            ("cross_q",),
+        ),
+        (
+            MLP,
+            {SELF_ATTENTION: 0.0, CROSS_ATTENTION: 0.0, MLP: 0.25},
+            ("mlp",),
+        ),
+    ],
+)
+def test_component_lambdas_independently_select_regularizer_gradients(
+    active_component,
+    component_lambdas,
+    expected_weight_names,
+):
+    model = _ToyDiT(num_blocks=1)
+    block = model.blocks[0]
+    regularizer = StructuredL21Regularizer(
+        enable_self_attention=True,
+        enable_cross_attention=True,
+        enable_mlp=True,
+    )
+    task_parameter = nn.Parameter(torch.tensor(2.0))
+    task_loss = task_parameter.square()
+
+    total_loss, metrics = apply_structured_l21(
+        task_loss,
+        model,
+        regularizer,
+        component_lambdas=component_lambdas,
+    )
+    expected = task_loss.detach() + component_lambdas[active_component] * metrics[
+        f"structured_l21_{active_component}_penalty"
+    ]
+    torch.testing.assert_close(total_loss.detach(), expected)
+    total_loss.backward()
+
+    weights = {
+        "q_proj": block.self_attn.q_proj.weight,
+        "k_proj": block.self_attn.k_proj.weight,
+        "v_proj": block.self_attn.v_proj.weight,
+        "cross_q": block.cross_attn.q_proj.weight,
+        "mlp": block.mlp.layer1.weight,
+    }
+    for name, weight in weights.items():
+        if name in expected_weight_names:
+            assert weight.grad is not None
+            assert torch.isfinite(weight.grad).all()
+            assert torch.count_nonzero(weight.grad) > 0
+        else:
+            assert weight.grad is None
+
+
+def test_component_lambdas_weighted_sum_is_exact_and_uses_one_regularizer_result():
+    model = _ToyDiT(num_blocks=1)
+    regularizer = StructuredL21Regularizer(
+        enable_self_attention=True,
+        enable_cross_attention=True,
+        enable_mlp=True,
+    )
+    component_lambdas = {
+        SELF_ATTENTION: 0.125,
+        CROSS_ATTENTION: 0.25,
+        MLP: 0.5,
+    }
+    task_loss = nn.Parameter(torch.tensor(2.0)).square()
+
+    result = regularizer(model)
+    total_loss = add_structured_l21_penalty(
+        task_loss,
+        result,
+        component_lambdas=component_lambdas,
+    )
+    expected = task_loss.detach() + sum(
+        component_lambdas[name] * result.penalties[name].detach() for name in component_lambdas
+    )
+    torch.testing.assert_close(total_loss.detach(), expected)
+    total_loss.backward()
+
+    block = model.blocks[0]
+    for weight in (
+        block.self_attn.q_proj.weight,
+        block.self_attn.k_proj.weight,
+        block.self_attn.v_proj.weight,
+        block.cross_attn.q_proj.weight,
+        block.mlp.layer1.weight,
+    ):
+        assert weight.grad is not None
+        assert torch.isfinite(weight.grad).all()
+
+
+def test_disabled_component_lambda_is_inert_and_does_not_scan_or_create_gradient(monkeypatch):
+    model = _tiny_dit()
+    regularizer = StructuredL21Regularizer(enable_mlp=True)
+    task_parameter = nn.Parameter(torch.tensor(2.0))
+    task_loss = task_parameter.square()
+
+    def fail_if_scanned(_regularizer, _model):
+        raise AssertionError("disabled component lambda must not scan DiT weights")
+
+    monkeypatch.setattr(StructuredL21Regularizer, "__call__", fail_if_scanned)
+    total_loss, metrics = apply_structured_l21(
+        task_loss,
+        model,
+        regularizer,
+        component_lambdas={SELF_ATTENTION: 1.0, CROSS_ATTENTION: 0.0, MLP: 0.0},
+    )
+    total_loss.backward()
+
+    assert total_loss is task_loss
+    assert metrics == {}
+    assert model.blocks[0].mlp.layer1.weight.grad is None
+
+
+def test_all_zero_component_lambdas_use_fast_path(monkeypatch):
+    model = _tiny_dit()
+    regularizer = StructuredL21Regularizer(
+        enable_self_attention=True,
+        enable_cross_attention=True,
+        enable_mlp=True,
+    )
+    task_parameter = nn.Parameter(torch.tensor(2.0))
+    task_loss = task_parameter.square()
+
+    def fail_if_scanned(_regularizer, _model):
+        raise AssertionError("all-zero component lambdas must not scan DiT weights")
+
+    monkeypatch.setattr(StructuredL21Regularizer, "__call__", fail_if_scanned)
+    total_loss, metrics = apply_structured_l21(
+        task_loss,
+        model,
+        regularizer,
+        component_lambdas={name: 0.0 for name in (SELF_ATTENTION, CROSS_ATTENTION, MLP)},
+    )
+    total_loss.backward()
+
+    assert total_loss is task_loss
+    assert metrics == {}
+    torch.testing.assert_close(task_parameter.grad, torch.tensor(4.0))
+
+
+def test_negative_component_lambda_is_rejected():
+    task_loss = torch.tensor(1.0, requires_grad=True)
+    with pytest.raises(ValueError, match="non-negative"):
+        apply_structured_l21(
+            task_loss,
+            _ToyDiT(num_blocks=1),
+            StructuredL21Regularizer(enable_mlp=True),
+            component_lambdas={MLP: -0.1},
+        )
+
+
 def test_predict2_2b_has_57344_mlp_input_groups():
     from cosmos_policy._src.predict2.configs.text2world.defaults.net import COSMOS_V1_2B_NET_MININET
 

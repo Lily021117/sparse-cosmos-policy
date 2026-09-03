@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Mapping
 
 import torch
 from torch import nn
@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 SELF_ATTENTION = "self_attention"
 CROSS_ATTENTION = "cross_attention"
 MLP = "mlp"
+COMPONENTS = (SELF_ATTENTION, CROSS_ATTENTION, MLP)
 
 
 @dataclass(frozen=True)
@@ -156,17 +157,26 @@ class StructuredL21Regularizer:
         if not blocks:
             raise ValueError("Could not find DiT blocks with self_attn, cross_attn, and mlp modules")
 
-        group_norms: Dict[str, torch.Tensor] = {}
+        # Traverse the logical DiT blocks once.  Besides avoiding repeated
+        # wrapper traversal under SAC/FSDP, this lets callers independently
+        # weight all three components without doing three model scans.
+        per_component_norms: Dict[str, list[torch.Tensor]] = {}
         if self.enable_self_attention:
-            group_norms[SELF_ATTENTION] = torch.cat(
-                [self._self_attention_group_norms(block) for block in blocks]
-            )
+            per_component_norms[SELF_ATTENTION] = []
         if self.enable_cross_attention:
-            group_norms[CROSS_ATTENTION] = torch.cat(
-                [self._cross_attention_group_norms(block) for block in blocks]
-            )
+            per_component_norms[CROSS_ATTENTION] = []
         if self.enable_mlp:
-            group_norms[MLP] = torch.cat([self._mlp_group_norms(block) for block in blocks])
+            per_component_norms[MLP] = []
+
+        for block in blocks:
+            if self.enable_self_attention:
+                per_component_norms[SELF_ATTENTION].append(self._self_attention_group_norms(block))
+            if self.enable_cross_attention:
+                per_component_norms[CROSS_ATTENTION].append(self._cross_attention_group_norms(block))
+            if self.enable_mlp:
+                per_component_norms[MLP].append(self._mlp_group_norms(block))
+
+        group_norms = {name: torch.cat(norms) for name, norms in per_component_norms.items()}
 
         penalties = {name: norms.sum() for name, norms in group_norms.items()}
         return StructuredL21Result(penalties=penalties, group_norms=group_norms)
@@ -175,22 +185,68 @@ class StructuredL21Regularizer:
 def add_structured_l21_penalty(
     task_loss: torch.Tensor,
     result: StructuredL21Result,
-    regularization_lambda: float,
+    regularization_lambda: float | None = None,
+    *,
+    component_lambdas: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
-    """Add L2,1 without changing the task-loss tensor when lambda is zero."""
-    if regularization_lambda < 0:
-        raise ValueError("structured L21 lambda must be non-negative")
-    if regularization_lambda == 0:
+    """Add independently weighted L2,1 components to ``task_loss``.
+
+    ``regularization_lambda`` remains as a backwards-compatible uniform
+    coefficient.  New callers should pass ``component_lambdas``.
+    """
+    lambdas = _resolve_component_lambdas(
+        result.penalties,
+        regularization_lambda=regularization_lambda,
+        component_lambdas=component_lambdas,
+    )
+    # Exclude zero-coefficient terms entirely, rather than constructing
+    # ``0 * penalty``.  The latter leaves a zero-valued autograd path and
+    # materializes misleading zero gradients on otherwise disabled modules.
+    active_penalties = (
+        (lambdas[name] * penalty for name, penalty in result.penalties.items() if lambdas[name] != 0)
+    )
+    weighted_penalty = sum(
+        active_penalties,
+        start=torch.zeros_like(task_loss),
+    )
+    if all(value == 0 for value in lambdas.values()):
         return task_loss
-    return task_loss + regularization_lambda * result.total
+    return task_loss + weighted_penalty
+
+
+def _resolve_component_lambdas(
+    enabled_penalties: Mapping[str, torch.Tensor],
+    *,
+    regularization_lambda: float | None,
+    component_lambdas: Mapping[str, float] | None,
+) -> Dict[str, float]:
+    """Validate coefficients and retain only components present in ``result``."""
+    if regularization_lambda is not None and component_lambdas is not None:
+        raise ValueError("Specify either regularization_lambda or component_lambdas, not both")
+
+    if component_lambdas is None:
+        uniform_lambda = 0.0 if regularization_lambda is None else regularization_lambda
+        component_lambdas = {name: uniform_lambda for name in COMPONENTS}
+
+    unknown = set(component_lambdas) - set(COMPONENTS)
+    if unknown:
+        raise ValueError(f"Unknown structured L21 component(s): {sorted(unknown)}")
+
+    values = {name: float(component_lambdas.get(name, 0.0)) for name in COMPONENTS}
+    if any(value < 0 for value in values.values()):
+        raise ValueError("structured L21 lambdas must be non-negative")
+    # A nonzero coefficient for a disabled component is intentionally inert:
+    # it cannot create a penalty or a gradient without a corresponding group.
+    return {name: values[name] for name in enabled_penalties}
 
 
 def apply_structured_l21(
     task_loss: torch.Tensor,
     model: nn.Module,
     regularizer: StructuredL21Regularizer,
-    regularization_lambda: float,
+    regularization_lambda: float | None = None,
     *,
+    component_lambdas: Mapping[str, float] | None = None,
     collect_diagnostics: bool = False,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Integrate L2,1 with a task loss, avoiding baseline weight scans.
@@ -199,14 +255,27 @@ def apply_structured_l21(
     without traversing model weights. Diagnostic-only collection is performed
     under ``no_grad`` so it cannot affect training gradients.
     """
-    if regularization_lambda < 0:
-        raise ValueError("structured L21 lambda must be non-negative")
-    if not regularizer.enabled or (regularization_lambda == 0 and not collect_diagnostics):
+    # Validate all supplied coefficients before the fast path, including a
+    # coefficient for a disabled component.
+    _resolve_component_lambdas(
+        {},
+        regularization_lambda=regularization_lambda,
+        component_lambdas=component_lambdas,
+    )
+    configured_lambdas = component_lambdas
+    if configured_lambdas is None:
+        configured_lambdas = {name: 0.0 if regularization_lambda is None else regularization_lambda for name in COMPONENTS}
+    enabled_lambdas = {
+        SELF_ATTENTION: configured_lambdas.get(SELF_ATTENTION, 0.0) if regularizer.enable_self_attention else 0.0,
+        CROSS_ATTENTION: configured_lambdas.get(CROSS_ATTENTION, 0.0) if regularizer.enable_cross_attention else 0.0,
+        MLP: configured_lambdas.get(MLP, 0.0) if regularizer.enable_mlp else 0.0,
+    }
+    if not regularizer.enabled or (all(value == 0 for value in enabled_lambdas.values()) and not collect_diagnostics):
         return task_loss, {}
 
-    if regularization_lambda > 0:
+    if any(value > 0 for value in enabled_lambdas.values()):
         result = regularizer(model)
-        total_loss = add_structured_l21_penalty(task_loss, result, regularization_lambda)
+        total_loss = add_structured_l21_penalty(task_loss, result, component_lambdas=enabled_lambdas)
     else:
         with torch.no_grad():
             result = regularizer(model)
