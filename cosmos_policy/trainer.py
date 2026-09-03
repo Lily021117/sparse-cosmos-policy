@@ -24,6 +24,7 @@ import signal
 
 import torch
 import torch.utils.data
+import wandb
 
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.trainer import ImaginaireTrainer
@@ -42,6 +43,36 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
 
     def __init__(self, config):
         super().__init__(config)
+
+    @staticmethod
+    def bilevel_phase_sequence(inner_steps: int, outer_steps: int) -> list[str]:
+        if inner_steps < 1 or outer_steps < 1:
+            raise ValueError("bilevel step counts must be positive")
+        return ["inner"] * inner_steps + ["outer"] * outer_steps
+
+    @staticmethod
+    def advance_bilevel_state(state: dict, inner_steps: int = 5, outer_steps: int = 1) -> dict:
+        """Advance counters after exactly one completed optimizer step."""
+        sequence = CosmosPolicyTrainer.bilevel_phase_sequence(inner_steps, outer_steps)
+        phase = sequence[state["phase_step_in_cycle"]]
+        if phase != state["next_phase"]:
+            raise ValueError("Bilevel phase state is inconsistent before advance")
+        updated = dict(state)
+        updated["global_optimizer_step"] += 1
+        updated[f"{phase}_step"] += 1
+        updated["phase_step_in_cycle"] += 1
+        if updated["phase_step_in_cycle"] == len(sequence):
+            updated["bilevel_cycle"] += 1
+            updated["phase_step_in_cycle"] = 0
+        updated["next_phase"] = sequence[updated["phase_step_in_cycle"]]
+        return updated
+
+    def _should_run_initial_validation(self, iteration: int) -> bool:
+        return (
+            self.config.trainer.run_validation
+            and iteration == 0
+            and self.config.trainer.run_validation_on_start
+        )
 
     def train(
         self,
@@ -62,9 +93,44 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
 
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()
-        optimizer, scheduler = model.init_optimizer_scheduler(self.config.optimizer, self.config.scheduler)
+        if self.config.trainer.enable_bilevel_training:
+            inner_optimizer, outer_optimizer, inner_params, outer_params, inner_scheduler, outer_scheduler = model.init_bilevel_optimizers(
+                self.config.optimizer, self.config.scheduler, outer_lr=1e-5
+            )
+            optimizer, scheduler = inner_optimizer, None
+        else:
+            optimizer, scheduler = model.init_optimizer_scheduler(self.config.optimizer, self.config.scheduler)
         grad_scaler = torch.amp.GradScaler("cuda", **self.config.trainer.grad_scaler_args)
         self.callbacks.on_optimizer_init_end()
+        if self.config.trainer.enable_bilevel_training:
+            bilevel_state = self.checkpointer.load_bilevel(
+                model, inner_optimizer, outer_optimizer, inner_scheduler, outer_scheduler, grad_scaler
+            )
+            if self.config.trainer.distributed_parallelism == "ddp":
+                model_ddp = distributed.parallel_model_wrapper(self.config.trainer.ddp, model)
+            elif self.config.trainer.distributed_parallelism == "fsdp":
+                model_ddp = model
+            else:
+                raise ValueError(
+                    f"Unknown distributed parallelism mode: {self.config.trainer.distributed_parallelism}"
+                )
+            self.callbacks.on_train_start(model, iteration=bilevel_state["global_optimizer_step"])
+            if self._should_run_initial_validation(bilevel_state["global_optimizer_step"]):
+                self.validate(model, dataloader_val, iteration=0)
+            with (
+                maybe_enable_profiling(self.config, global_step=bilevel_state["global_optimizer_step"]) as torch_profiler,
+                maybe_enable_memory_snapshot(self.config, global_step=bilevel_state["global_optimizer_step"]) as memory_profiler,
+            ):
+                self._train_bilevel(
+                    model, dataloader_train, dataloader_val, inner_optimizer, outer_optimizer,
+                    inner_scheduler, outer_scheduler, grad_scaler, bilevel_state, torch_profiler,
+                    memory_profiler, model_ddp=model_ddp,
+                )
+            self.callbacks.on_train_end(model, iteration=self._bilevel_global_step)
+            self.checkpointer.finalize()
+            distributed.barrier()
+            self.callbacks.on_app_end()
+            return
         # Load the model checkpoint and get the starting iteration number.
         iteration = self.checkpointer.load(model, optimizer, scheduler, grad_scaler)
         grad_accum_iter = 0
@@ -80,7 +146,7 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         log.info("Starting training...")
         self.callbacks.on_train_start(model, iteration=iteration)
         # Initial validation.
-        if self.config.trainer.run_validation and iteration == 0 and self.config.trainer.run_validation_on_start:
+        if self._should_run_initial_validation(iteration):
             self.validate(model, dataloader_val, iteration=iteration)
         _end_training = False
         with (
@@ -161,3 +227,161 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         self.checkpointer.finalize()
         distributed.barrier()
         self.callbacks.on_app_end()
+
+    def _train_bilevel(self, model, dataloader_train, dataloader_val, inner_optimizer, outer_optimizer, inner_scheduler, outer_scheduler, grad_scaler, state, torch_profiler=None, memory_profiler=None, model_ddp=None):
+        """First-order truncated alternating loop; each optimizer step accumulates N micro-batches."""
+        if model_ddp is None:
+            model_ddp = model
+        self._bilevel_global_step = state["global_optimizer_step"]
+        model.train()
+        epoch = 0
+        if hasattr(dataloader_train, "sampler") and hasattr(dataloader_train.sampler, "set_epoch"):
+            dataloader_train.sampler.set_epoch(epoch)
+        iterator = iter(dataloader_train)
+        global_step = state["global_optimizer_step"]
+        last_saved_global_optimizer_step = None
+        accum = self.config.trainer.grad_accum_iter
+        while global_step < self.config.trainer.max_iter:
+            inner_param_list = [p for name, p in model.net.named_parameters() if not name.endswith("shared_token_linear.weight") and p.requires_grad]
+            outer_param_list = [p for name, p in model.net.named_parameters() if name.endswith("shared_token_linear.weight")]
+            sequence = self.bilevel_phase_sequence(self.config.trainer.bilevel_inner_steps, self.config.trainer.bilevel_outer_steps)
+            for phase in sequence[state["phase_step_in_cycle"]:]:
+                if global_step >= self.config.trainer.max_iter:
+                    break
+                optimizer, params = (inner_optimizer, inner_param_list) if phase == "inner" else (outer_optimizer, outer_param_list)
+                inner_optimizer.zero_grad(set_to_none=True); outer_optimizer.zero_grad(set_to_none=True)
+                model._bilevel_phase = phase
+                model._bilevel_active_optimizer = optimizer
+                for micro_step in range(accum):
+                    self.callbacks.on_before_dataloading(global_step)
+                    try:
+                        with (
+                            self.training_timer("dataloader_train"),
+                            self.straggler_detector.profile_section(
+                                "dataloading",
+                                self.config.trainer.straggler_detection.analyze_dataloading,
+                                profile_cuda=False,
+                            ),
+                        ):
+                            batch = next(iterator)
+                    except StopIteration:
+                        epoch += 1
+                        if hasattr(dataloader_train, "sampler") and hasattr(dataloader_train.sampler, "set_epoch"):
+                            dataloader_train.sampler.set_epoch(epoch)
+                        iterator = iter(dataloader_train)
+                        with self.training_timer("dataloader_train"):
+                            batch = next(iterator)
+                    finally:
+                        self.callbacks.on_after_dataloading(global_step)
+                    batch = misc.to(batch, device="cuda")
+                    self.callbacks.on_training_step_start(model, batch, iteration=global_step)
+                    self.callbacks.on_training_step_batch_start(model, batch, iteration=global_step)
+                    with distributed.ddp_sync_grad(model_ddp, micro_step == accum - 1):
+                        self.callbacks.on_before_forward(iteration=global_step)
+                        with self.training_timer("forward"):
+                            with self.straggler_detector.profile_section(
+                                "fwd", self.config.trainer.straggler_detection.analyze_forward
+                            ):
+                                output_batch, loss = model_ddp.training_step(batch, global_step, phase=phase)
+                        self.callbacks.on_after_forward(iteration=global_step)
+                        self.callbacks.on_before_backward(model_ddp, loss, iteration=global_step)
+                        with self.training_timer("backward"):
+                            with self.straggler_detector.profile_section(
+                                "bwd", self.config.trainer.straggler_detection.analyze_backward
+                            ):
+                                grad_scaler.scale(loss / accum).backward()
+                                if self.config.trainer.distributed_parallelism == "ddp":
+                                    model_ddp.module.on_after_backward()
+                                else:
+                                    model_ddp.on_after_backward()
+                        self.callbacks.on_after_backward(model_ddp, iteration=global_step)
+                    self.callbacks.on_training_step_batch_end(model, batch, output_batch, loss, iteration=global_step)
+                active_scheduler = inner_scheduler if phase == "inner" else outer_scheduler
+                with self.training_timer("optimizer_step"):
+                    with self.straggler_detector.profile_section(
+                        "opt", self.config.trainer.straggler_detection.analyze_optimizer
+                    ):
+                        grad_scaler.unscale_(optimizer)
+                        self._clear_inactive_gradients(model, params)
+                        # Existing callbacks (including GradClip/W&B LR logging) now see
+                        # only the active phase gradients and optimizer.
+                        self.callbacks.on_before_optimizer_step(
+                            model_ddp, optimizer, active_scheduler, grad_scaler, iteration=global_step
+                        )
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
+                        active_scheduler.step()
+                        self.callbacks.on_before_zero_grad(
+                            model_ddp, optimizer, active_scheduler, iteration=global_step
+                        )
+                        if self.config.trainer.distributed_parallelism == "ddp":
+                            model_ddp.module.on_before_zero_grad(
+                                optimizer, active_scheduler, iteration=global_step
+                            )
+                        else:
+                            model_ddp.on_before_zero_grad(
+                                optimizer, active_scheduler, iteration=global_step
+                            )
+                        inner_optimizer.zero_grad(set_to_none=True)
+                        outer_optimizer.zero_grad(set_to_none=True)
+                state = self.advance_bilevel_state(state, self.config.trainer.bilevel_inner_steps, self.config.trainer.bilevel_outer_steps)
+                global_step = state["global_optimizer_step"]
+                self._bilevel_global_step = global_step
+                raw_task_loss = output_batch["bilevel_raw_task_loss"]
+                output_batch.update({
+                    "bilevel/phase": phase,
+                    "bilevel/global_optimizer_step": global_step,
+                    "bilevel/inner_step": state["inner_step"],
+                    "bilevel/outer_step": state["outer_step"],
+                    "bilevel/cycle": state["bilevel_cycle"],
+                    "bilevel/phase_step_in_cycle": state["phase_step_in_cycle"],
+                    "bilevel/objective": loss.detach(),
+                })
+                if distributed.is_rank0() and wandb.run:
+                    bilevel_log = {
+                        "bilevel/phase": phase,
+                        "bilevel/global_optimizer_step": global_step,
+                        "bilevel/inner_step": state["inner_step"],
+                        "bilevel/outer_step": state["outer_step"],
+                        "bilevel/cycle": state["bilevel_cycle"],
+                        "bilevel/phase_step_in_cycle": state["phase_step_in_cycle"],
+                        "bilevel/task_loss": raw_task_loss.detach().float().item(),
+                        f"bilevel/{phase}_objective": loss.detach().float().item(),
+                    }
+                    if phase == "inner":
+                        bilevel_log.update({
+                            f"bilevel/{name}": value.detach().float().item()
+                            for name, value in output_batch.items()
+                            if name.startswith("structured_l21_") and torch.is_tensor(value)
+                        })
+                    wandb.log(bilevel_log, step=global_step)
+                # Match the ordinary lifecycle: checkpoint the completed
+                # optimizer step, then emit step-end, then run validation.
+                if global_step % self.config.checkpoint.save_iter == 0:
+                    self.checkpointer.save_bilevel(
+                        model, inner_optimizer, outer_optimizer, inner_scheduler,
+                        outer_scheduler, grad_scaler, state,
+                    )
+                    last_saved_global_optimizer_step = global_step
+                self.callbacks.on_training_step_end(model, batch, output_batch, loss, iteration=global_step)
+                if dataloader_val is not None and self.config.trainer.run_validation and global_step % self.config.trainer.validation_iter == 0:
+                    self.validate(model, dataloader_val, iteration=global_step)
+                signal.alarm(self.config.trainer.timeout_period)
+                self.straggler_detector.generate_report(global_step)
+                if torch_profiler:
+                    torch_profiler.step()
+                if memory_profiler:
+                    memory_profiler.step()
+            if global_step >= self.config.trainer.max_iter:
+                break
+        if last_saved_global_optimizer_step != global_step:
+            self.checkpointer.save_bilevel(
+                model, inner_optimizer, outer_optimizer, inner_scheduler, outer_scheduler, grad_scaler, state
+            )
+
+    @staticmethod
+    def _clear_inactive_gradients(model, active_params) -> None:
+        active_ids = {id(parameter) for parameter in active_params}
+        for parameter in model.parameters():
+            if id(parameter) not in active_ids:
+                parameter.grad = None

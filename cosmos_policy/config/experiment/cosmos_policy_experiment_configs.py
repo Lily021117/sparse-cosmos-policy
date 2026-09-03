@@ -195,6 +195,30 @@ cosmos_predict2_2b_480p_libero = LazyDict(
         upload_reproducible_setup=False,
     )
 )
+
+# Truncated alternating bilevel variant.  The shared projection must be
+# trainable before FSDP wrapping; optimizer membership, rather than dynamic
+# requires_grad changes, isolates the inner and outer updates.
+cosmos_predict2_2b_480p_libero__bilevel = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_libero",
+            "_self_",
+        ],
+        trainer=dict(
+            enable_bilevel_training=True,
+            bilevel_inner_steps=5,
+            bilevel_outer_steps=1,
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(net=dict(freeze_shared_token_linear=False)),
+        ),
+        job=dict(
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_libero__bilevel",
+        ),
+    )
+)
 # Inference version
 cosmos_predict2_2b_480p_libero__inference_only = LazyDict(
     dict(
@@ -484,6 +508,7 @@ def register_configs():
     for _item in [
         # LIBERO
         cosmos_predict2_2b_480p_libero,  # *** Main checkpoint ***
+        cosmos_predict2_2b_480p_libero__bilevel,
         cosmos_predict2_2b_480p_libero__inference_only,
         # RoboCasa
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task,  # *** Main checkpoint ***

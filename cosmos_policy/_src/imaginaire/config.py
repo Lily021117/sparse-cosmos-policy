@@ -394,6 +394,10 @@ class TrainerConfig:
     memory_format: torch.memory_format = torch.preserve_format
     # Gradient accumulation (update step every N iteration).
     grad_accum_iter: int = 1
+    # Optional truncated alternating optimization. Disabled preserves the legacy loop.
+    enable_bilevel_training: bool = False
+    bilevel_inner_steps: int = 5
+    bilevel_outer_steps: int = 1
     # Straggler Detection config
     straggler_detection: StragglerDetectionConfig = attrs.field(factory=StragglerDetectionConfig)
     # Profiling config

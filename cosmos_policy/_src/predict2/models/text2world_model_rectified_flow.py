@@ -313,6 +313,34 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
         scheduler = get_base_scheduler(optimizer, self, scheduler_config)
         return optimizer, scheduler
 
+    def init_bilevel_optimizers(self, optimizer_config: LazyDict, scheduler_config: LazyDict, outer_lr: float = 1e-5):
+        """Build disjoint optimizers after FSDP wrapping (no requires_grad toggling)."""
+        from copy import deepcopy
+
+        class _ParameterView:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def named_parameters(self):
+                return iter(self._items)
+
+        named = list(self.net.named_parameters())
+        outer = [(n, p) for n, p in named if n.endswith("shared_token_linear.weight")]
+        inner = [(n, p) for n, p in named if not n.endswith("shared_token_linear.weight") and p.requires_grad]
+        if len(outer) != 1:
+            raise AssertionError(f"Expected one outer parameter, found {[n for n, _ in outer]}")
+        if not outer[0][1].requires_grad:
+            raise AssertionError("SharedTokenLinear must be trainable before FSDP wrapping in bilevel mode")
+        if set(id(p) for _, p in inner) & set(id(p) for _, p in outer):
+            raise AssertionError("Inner/outer parameter sets overlap")
+        inner_opt = lazy_instantiate(optimizer_config, model=_ParameterView(inner))
+        outer_cfg = deepcopy(optimizer_config)
+        outer_cfg["lr"] = outer_lr
+        outer_opt = lazy_instantiate(outer_cfg, model=_ParameterView(outer))
+        inner_sched = get_base_scheduler(inner_opt, self, scheduler_config)
+        outer_sched = torch.optim.lr_scheduler.LambdaLR(outer_opt, lr_lambda=lambda _: 1.0)
+        return inner_opt, outer_opt, inner, outer, inner_sched, outer_sched
+
     # ------------------------ training hooks ------------------------
     def on_before_zero_grad(
         self, optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.LRScheduler, iteration: int

@@ -751,6 +751,100 @@ class DistributedCheckpointer(AbstractCheckpointer):
         if self.callbacks is not None:
             self.callbacks.on_save_checkpoint_end(model=None, iteration=iteration)
 
+    @staticmethod
+    def validate_bilevel_state(state: Dict[str, Any], inner_steps: int = 5, outer_steps: int = 1) -> None:
+        """Validate optimizer-step-boundary state for truncated alternating training."""
+        required = {
+            "global_optimizer_step", "inner_step", "outer_step", "bilevel_cycle",
+            "phase_step_in_cycle", "next_phase",
+        }
+        missing = required - set(state)
+        if missing:
+            raise ValueError(f"Missing bilevel checkpoint fields: {sorted(missing)}")
+        total = inner_steps + outer_steps
+        phase_step = int(state["phase_step_in_cycle"])
+        if not 0 <= phase_step < total:
+            raise ValueError(f"phase_step_in_cycle must be in [0, {total}), got {phase_step}")
+        if int(state["global_optimizer_step"]) != int(state["inner_step"]) + int(state["outer_step"]):
+            raise ValueError("global_optimizer_step must equal inner_step + outer_step")
+        expected_next = "inner" if phase_step < inner_steps else "outer"
+        if state["next_phase"] != expected_next:
+            raise ValueError(f"next_phase={state['next_phase']} conflicts with phase_step_in_cycle={phase_step}")
+        if int(state["bilevel_cycle"]) != int(state["outer_step"]):
+            raise ValueError("bilevel_cycle must equal completed outer steps for K_outer=1")
+
+    def save_bilevel(
+        self,
+        model: ImaginaireModel,
+        inner_optimizer: torch.optim.Optimizer,
+        outer_optimizer: torch.optim.Optimizer,
+        inner_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        outer_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        grad_scaler: torch.amp.GradScaler,
+        bilevel_state: Dict[str, Any],
+    ) -> None:
+        """Save two independent optimizer/scheduler states at a phase-step boundary."""
+        self.validate_bilevel_state(bilevel_state)
+        iteration = int(bilevel_state["global_optimizer_step"])
+        if self.callbacks is not None:
+            self.callbacks.on_save_checkpoint_start(model, iteration)
+        checkpoint_file = f"iter_{iteration:09}"
+        to_save_dict = {
+            "model": ModelWrapper(model).state_dict(),
+            "inner_optim": OptimizerWrapper(model, inner_optimizer).state_dict(),
+            "outer_optim": OptimizerWrapper(model, outer_optimizer).state_dict(),
+            "inner_scheduler": inner_scheduler.state_dict(),
+            "outer_scheduler": outer_scheduler.state_dict(),
+            "trainer": {"grad_scaler": grad_scaler.state_dict(), "iteration": iteration},
+            "bilevel": dict(bilevel_state),
+        }
+        for key in list(to_save_dict):
+            to_save_dict[key] = (to_save_dict[key], os.path.join(self.save_dirname, checkpoint_file, key))
+        self.save_state_dict_worker(to_save_dict, checkpoint_file)
+        if self.callbacks is not None:
+            self.callbacks.on_save_checkpoint_success(iteration=iteration, elapsed_time=0.0)
+            self.callbacks.on_save_checkpoint_end(model=None, iteration=iteration)
+
+    def load_bilevel(
+        self,
+        model: ImaginaireModel,
+        inner_optimizer: torch.optim.Optimizer,
+        outer_optimizer: torch.optim.Optimizer,
+        inner_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        outer_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        grad_scaler: torch.amp.GradScaler,
+    ) -> Dict[str, Any]:
+        """Load a bilevel checkpoint, or fall back to the legacy initial-model loader."""
+        latest = self._read_latest_checkpoint_file()
+        if latest is None:
+            self.load(model, inner_optimizer, inner_scheduler, grad_scaler)
+            state = {"global_optimizer_step": 0, "inner_step": 0, "outer_step": 0,
+                     "bilevel_cycle": 0, "phase_step_in_cycle": 0, "next_phase": "inner"}
+            # ``load`` already emitted the complete legacy callback lifecycle.
+            return state
+        if self.callbacks is not None:
+            self.callbacks.on_load_checkpoint_start(model)
+        checkpoint_path = os.path.join(self.load_dirname, latest)
+        reader_for = lambda key: self.get_storage_reader(os.path.join(checkpoint_path, key))
+        model_wrapper = ModelWrapper(model)
+        model_state = model_wrapper.state_dict(); dcp.load(model_state, storage_reader=reader_for("model"), planner=DefaultLoadPlanner(allow_partial_load=True)); model_wrapper.load_state_dict(model_state)
+        for key, optimizer in (("inner_optim", inner_optimizer), ("outer_optim", outer_optimizer)):
+            wrapper = OptimizerWrapper(model, optimizer); state = wrapper.state_dict(); dcp.load(state, storage_reader=reader_for(key), planner=DefaultLoadPlanner(allow_partial_load=True)); wrapper.load_state_dict(state)
+        for key, scheduler in (("inner_scheduler", inner_scheduler), ("outer_scheduler", outer_scheduler)):
+            state = scheduler.state_dict(); dcp.load(state, storage_reader=reader_for(key), planner=DefaultLoadPlanner(allow_partial_load=True)); scheduler.load_state_dict(state)
+        trainer_state = {"grad_scaler": grad_scaler.state_dict(), "iteration": 0}; dcp.load(trainer_state, storage_reader=reader_for("trainer"), planner=DefaultLoadPlanner(allow_partial_load=True)); grad_scaler.load_state_dict(trainer_state["grad_scaler"])
+        state = {"global_optimizer_step": 0, "inner_step": 0, "outer_step": 0, "bilevel_cycle": 0, "phase_step_in_cycle": 0, "next_phase": "inner"}; dcp.load(state, storage_reader=reader_for("bilevel"), planner=DefaultLoadPlanner(allow_partial_load=True)); self.validate_bilevel_state(state)
+        if self.callbacks is not None:
+            self.callbacks.on_load_checkpoint(model, state_dict=state)
+        torch.cuda.empty_cache()
+        if self.callbacks is not None:
+            self.callbacks.on_load_checkpoint_end(
+                model,
+                iteration=state["global_optimizer_step"],
+                checkpoint_path=checkpoint_path,
+            )
+        return state
+
     def finalize(self) -> None:
         super().finalize()
         if self.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:

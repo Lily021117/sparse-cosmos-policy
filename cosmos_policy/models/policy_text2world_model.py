@@ -40,7 +40,7 @@ from cosmos_policy._src.predict2.models.text2world_model import (
 from cosmos_policy.conditioner import Text2WorldCondition
 from cosmos_policy.modules.cosmos_sampler import CosmosPolicySampler
 from cosmos_policy.modules.hybrid_edm_sde import HybridEDMSDE
-from cosmos_policy.structured_l21 import StructuredL21Regularizer, apply_structured_l21
+from cosmos_policy.structured_l21 import StructuredL21Regularizer, apply_structured_l21_for_phase
 
 
 def replace_latent_with_action_chunk(
@@ -287,8 +287,21 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             "mlp": self.config.structured_l21_mlp_lambda,
         }
 
+    def _objective_for_phase(
+        self, raw_task_loss: torch.Tensor, phase: str
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Build the phase objective without recomputing the task forward."""
+        return apply_structured_l21_for_phase(
+            raw_task_loss,
+            self.net,
+            self.structured_l21_regularizer,
+            phase=phase,
+            component_lambdas=self._structured_l21_component_lambdas(),
+            collect_diagnostics=self.config.structured_l21_diagnostic_metrics,
+        )
+
     def training_step(
-        self, data_batch: dict[str, torch.Tensor], iteration: int
+        self, data_batch: dict[str, torch.Tensor], iteration: int, phase: str = "inner"
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
         Performs a single training step for the Cosmos Policy diffusion model.
@@ -355,13 +368,9 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         else:
             raise ValueError(f"Invalid loss_reduce: {self.loss_reduce}")
 
-        kendall_loss, structured_l21_metrics = apply_structured_l21(
-            kendall_loss,
-            self.net,
-            self.structured_l21_regularizer,
-            component_lambdas=self._structured_l21_component_lambdas(),
-            collect_diagnostics=self.config.structured_l21_diagnostic_metrics,
-        )
+        raw_task_loss = kendall_loss
+        kendall_loss, structured_l21_metrics = self._objective_for_phase(raw_task_loss, phase)
+        output_batch["bilevel_raw_task_loss"] = raw_task_loss.detach()
         output_batch.update(structured_l21_metrics)
 
         return output_batch, kendall_loss

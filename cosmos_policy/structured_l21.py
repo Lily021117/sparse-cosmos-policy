@@ -282,3 +282,26 @@ def apply_structured_l21(
         total_loss = task_loss
 
     return total_loss, result.detached_metrics()
+
+
+def apply_structured_l21_for_phase(
+    task_loss: torch.Tensor,
+    model: nn.Module,
+    regularizer: StructuredL21Regularizer,
+    *,
+    phase: str,
+    component_lambdas: Mapping[str, float],
+    collect_diagnostics: bool = False,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Build the inner or outer objective without another model forward."""
+    if phase == "outer":
+        return task_loss, {}
+    if phase != "inner":
+        raise ValueError(f"Unknown optimization phase: {phase}")
+    return apply_structured_l21(
+        task_loss,
+        model,
+        regularizer,
+        component_lambdas=component_lambdas,
+        collect_diagnostics=collect_diagnostics,
+    )
