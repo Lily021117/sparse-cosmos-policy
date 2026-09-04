@@ -119,6 +119,29 @@ def test_all_group_definitions_have_expected_counts_and_values():
     )
 
 
+def test_block_subset_regularizes_only_selected_dit_blocks():
+    model = _ToyDiT(num_blocks=4)
+    for parameter in model.parameters():
+        nn.init.ones_(parameter)
+
+    regularizer = StructuredL21Regularizer(
+        enable_self_attention=True,
+        enable_cross_attention=True,
+        enable_mlp=True,
+    )
+    selected = regularizer(model, block_indices=(2, 3))
+    block_two = regularizer(model, block_indices=(2,))
+    block_three = regularizer(model, block_indices=(3,))
+
+    for component in (SELF_ATTENTION, CROSS_ATTENTION, MLP):
+        # Three input-channel groups per selected toy block.
+        assert selected.group_norms[component].numel() == 2 * 3
+        torch.testing.assert_close(
+            selected.penalties[component],
+            block_two.penalties[component] + block_three.penalties[component],
+        )
+
+
 @pytest.mark.parametrize(
     ("enabled_name", "kwargs"),
     [

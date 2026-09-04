@@ -63,6 +63,14 @@ class ConfigV2(config.Config):
         ]
     )
 
+    def validate(self) -> None:
+        # Last-K alternating bilevel changes the set of gradient-producing
+        # parameters between inner and outer phases.  Resolve the required
+        # dynamic-graph DDP settings before Config.freeze() and before the
+        # trainer constructs DDP.
+        Trainer.configure_bilevel_last_k_ddp(self.trainer, self.model.config)
+        super().validate()
+
 
 def make_config_v2():
     # Get default config

@@ -161,7 +161,7 @@ cosmos_predict2_2b_480p_libero = LazyDict(
             context_parallel_size=1,
         ),
         checkpoint=dict(
-            load_path=get_checkpoint_path("hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt"),
+            load_path="hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt",
             load_training_state=False,  # This means do not load train state from the base checkpoint above (load_path); but when resuming this job, will load train state
             strict_resume=False,
             save_iter=1000,
@@ -211,11 +211,46 @@ cosmos_predict2_2b_480p_libero__bilevel = LazyDict(
             bilevel_outer_steps=1,
         ),
         model=L(CosmosPolicyVideo2WorldModel)(
-            config=dict(net=dict(freeze_shared_token_linear=False)),
+            config=dict(
+                net=dict(freeze_shared_token_linear=False),
+                pretrained_checkpoint_path="/data/lyc/projects/cosmos_policy_libero_eval/hf_cache/models--nvidia--Cosmos-Policy-LIBERO-Predict2-2B/snapshots/cb689ec0e3347c13667d70a78a3447388f5c3bb8/Cosmos-Policy-LIBERO-Predict2-2B.pt",
+            ),
         ),
         job=dict(
             group="cosmos_v2_finetune",
             name="cosmos_predict2_2b_480p_libero__bilevel",
+        ),
+    )
+)
+
+# Single-GPU/no-FSDP diagnostic variant: retain only the final DiT block in
+# the inner optimizer and L2,1 traversal.  Other values can be supplied by
+# overriding ``trainer.bilevel_inner_last_k_blocks`` (for example 2 or 4).
+cosmos_predict2_2b_480p_libero__bilevel_last_block = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2_2b_480p_libero__bilevel",
+            "_self_",
+        ],
+        trainer=dict(
+            bilevel_inner_last_k_blocks=1,
+            # Inner and outer intentionally use different parameter sets.
+            ddp=dict(static_graph=False, find_unused_parameters=True),
+        ),
+        model=L(CosmosPolicyVideo2WorldModel)(
+            config=dict(
+                structured_l21_lambda=0.0,
+                enable_sa_input_channel_l21=True,
+                enable_ca_query_input_channel_l21=True,
+                enable_mlp_input_channel_l21=True,
+                structured_l21_sa_lambda=5.7594939e-6,
+                structured_l21_ca_lambda=1.9024074e-7,
+                structured_l21_mlp_lambda=2.24092e-6,
+            ),
+        ),
+        job=dict(
+            group="cosmos_v2_finetune",
+            name="cosmos_predict2_2b_480p_libero__bilevel_last_block",
         ),
     )
 )
@@ -441,9 +476,7 @@ cosmos_predict2_2b_480p_aloha_185_demos_4_tasks_mixture_foldshirt15_candiesinbow
         ],
         checkpoint=dict(
             # Resume from 50K checkpoint of base Cosmos Policy run
-            load_path=get_checkpoint_path(
-                "hf://nvidia/Cosmos-Policy-ALOHA-Predict2-2B/Cosmos-Policy-ALOHA-Predict2-2B.pt"
-            ),
+            load_path="hf://nvidia/Cosmos-Policy-ALOHA-Predict2-2B/Cosmos-Policy-ALOHA-Predict2-2B.pt",
         ),
         scheduler=dict(
             # LR decay for 15K steps in cycle #1, then decay by 5x and stay constant forever in cycle #2
@@ -509,6 +542,7 @@ def register_configs():
         # LIBERO
         cosmos_predict2_2b_480p_libero,  # *** Main checkpoint ***
         cosmos_predict2_2b_480p_libero__bilevel,
+        cosmos_predict2_2b_480p_libero__bilevel_last_block,
         cosmos_predict2_2b_480p_libero__inference_only,
         # RoboCasa
         cosmos_predict2_2b_480p_robocasa_50_demos_per_task,  # *** Main checkpoint ***

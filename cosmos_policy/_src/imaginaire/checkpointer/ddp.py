@@ -28,6 +28,7 @@ from cosmos_policy._src.imaginaire.checkpointer.safe_broadcast import broadcast_
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.utils import distributed, log, misc
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
+from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
 StateDictItemPath = namedtuple("StateDictItemPath", ["state_dict", "save_path"])
 
@@ -335,7 +336,7 @@ class Checkpointer(AbstractCheckpointer):
         else:
             if self.load_path:
                 # 2. Load the module weights specified by config_checkpoint.path.
-                checkpoint_path = self.load_path
+                checkpoint_path = get_checkpoint_path(self.load_path)
                 if self.load_s3_backend_key:
                     checkpoint_path = f"s3://ckpt/{checkpoint_path}"
                 if self.load_training_state:

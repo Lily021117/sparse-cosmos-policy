@@ -1,4 +1,6 @@
 import torch
+import pytest
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,6 +56,20 @@ class _BilevelCheckpointer:
 
     def save_bilevel(self, *args):
         self.states.append(args[-1].copy())
+
+
+class _TinyDiTBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+
+class _TinyLastKNet(torch.nn.Module):
+    def __init__(self, num_blocks=28):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_TinyDiTBlock() for _ in range(num_blocks)])
+        self.shared_token_linear = torch.nn.Linear(1, 1, bias=False)
+        self.non_dit_parameter = torch.nn.Parameter(torch.ones(1))
 
 
 def test_bilevel_phase_sequence_and_accumulation_unit():
@@ -307,3 +323,116 @@ def test_libero_ordinary_and_bilevel_freeze_configuration():
     assert "freeze_shared_token_linear=True" in ordinary
     assert "enable_bilevel_training=True" in variant
     assert "freeze_shared_token_linear=False" in variant
+
+
+@pytest.mark.parametrize(
+    ("last_k", "expected_indices"),
+    [(1, (27,)), (2, (26, 27)), (4, (24, 25, 26, 27))],
+)
+def test_last_k_inner_optimizer_subset_and_phase_freeze(last_k, expected_indices):
+    net = _TinyLastKNet()
+    indices = CosmosPolicyTrainer.bilevel_inner_block_indices(net, last_k)
+    assert indices == expected_indices
+
+    # This mirrors the model API's block-prefix selection used to construct
+    # the inner optimizer, without importing the heavyweight runtime model.
+    inner = [
+        (name, parameter)
+        for name, parameter in net.named_parameters()
+        if name.startswith(tuple(f"blocks.{index}." for index in indices))
+    ]
+    outer = [
+        (name, parameter)
+        for name, parameter in net.named_parameters()
+        if name.endswith("shared_token_linear.weight")
+    ]
+    inner_names = {name for name, _ in inner}
+    outer_names = {name for name, _ in outer}
+    assert inner_names == {f"blocks.{index}.weight" for index in expected_indices}
+    assert outer_names == {"shared_token_linear.weight"}
+    assert {id(parameter) for _, parameter in inner}.isdisjoint(
+        {id(parameter) for _, parameter in outer}
+    )
+
+    CosmosPolicyTrainer.configure_bilevel_parameter_phase(net, "inner", indices)
+    assert {
+        name for name, parameter in net.named_parameters() if parameter.requires_grad
+    } == inner_names
+    assert net._bilevel_inner_block_indices == expected_indices
+
+    CosmosPolicyTrainer.configure_bilevel_parameter_phase(net, "outer", indices)
+    assert {
+        name for name, parameter in net.named_parameters() if parameter.requires_grad
+    } == outer_names
+    assert net._bilevel_inner_block_indices is None
+
+
+def test_full_dit_bilevel_default_has_no_last_k_subset():
+    net = _TinyLastKNet()
+    assert CosmosPolicyTrainer.bilevel_inner_block_indices(net, None) is None
+    CosmosPolicyTrainer.configure_bilevel_parameter_phase(net, "inner", None)
+    assert all(parameter.requires_grad for parameter in net.parameters())
+
+
+def test_last_k_ddp_settings_are_dynamic_only_for_no_fsdp_bilevel():
+    ordinary = SimpleNamespace(
+        enable_bilevel_training=False,
+        bilevel_inner_last_k_blocks=None,
+        ddp=SimpleNamespace(static_graph=True, find_unused_parameters=False),
+    )
+    assert not CosmosPolicyTrainer.configure_bilevel_last_k_ddp(
+        ordinary, SimpleNamespace(fsdp_shard_size=1)
+    )
+    assert ordinary.ddp.static_graph is True
+    assert ordinary.ddp.find_unused_parameters is False
+
+    full_dit = SimpleNamespace(
+        enable_bilevel_training=True,
+        bilevel_inner_last_k_blocks=None,
+        ddp=SimpleNamespace(static_graph=True, find_unused_parameters=False),
+    )
+    assert not CosmosPolicyTrainer.configure_bilevel_last_k_ddp(
+        full_dit, SimpleNamespace(fsdp_shard_size=1)
+    )
+    assert full_dit.ddp.static_graph is True
+    assert full_dit.ddp.find_unused_parameters is False
+
+    last_k = SimpleNamespace(
+        enable_bilevel_training=True,
+        bilevel_inner_last_k_blocks=1,
+        ddp=SimpleNamespace(static_graph=True, find_unused_parameters=False),
+    )
+    assert CosmosPolicyTrainer.configure_bilevel_last_k_ddp(
+        last_k, SimpleNamespace(fsdp_shard_size=1)
+    )
+    assert last_k.ddp.static_graph is False
+    assert last_k.ddp.find_unused_parameters is True
+
+
+def test_ddp_dynamic_used_parameter_sets_accept_alternating_phases():
+    if torch.distributed.is_initialized():
+        pytest.skip("requires an isolated one-rank process group")
+    with tempfile.NamedTemporaryFile() as init_file:
+        torch.distributed.init_process_group(
+            backend="gloo", init_method=f"file://{init_file.name}", rank=0, world_size=1
+        )
+        try:
+            class AlternatingModule(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.inner = torch.nn.Linear(1, 1, bias=False)
+                    self.outer = torch.nn.Linear(1, 1, bias=False)
+
+                def forward(self, x, phase):
+                    return self.inner(x) if phase == "inner" else self.outer(x)
+
+            model = torch.nn.parallel.DistributedDataParallel(
+                AlternatingModule(), find_unused_parameters=True, static_graph=False
+            )
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            for phase in ("inner", "outer"):
+                optimizer.zero_grad(set_to_none=True)
+                model(torch.ones(1, 1), phase).sum().backward()
+                optimizer.step()
+        finally:
+            torch.distributed.destroy_process_group()

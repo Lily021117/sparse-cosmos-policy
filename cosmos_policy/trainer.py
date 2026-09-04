@@ -67,6 +67,64 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         updated["next_phase"] = sequence[updated["phase_step_in_cycle"]]
         return updated
 
+    @staticmethod
+    def bilevel_inner_block_indices(net, last_k_blocks: int | None) -> tuple[int, ...] | None:
+        """Resolve the optional final-K DiT subset for an inner update."""
+        if last_k_blocks is None:
+            return None
+        if isinstance(last_k_blocks, bool) or not isinstance(last_k_blocks, int):
+            raise TypeError("bilevel_inner_last_k_blocks must be an integer or None")
+        num_blocks = len(net.blocks)
+        if not 1 <= last_k_blocks <= num_blocks:
+            raise ValueError(
+                f"bilevel_inner_last_k_blocks must be in [1, {num_blocks}], got {last_k_blocks}"
+            )
+        return tuple(range(num_blocks - last_k_blocks, num_blocks))
+
+    @staticmethod
+    def configure_bilevel_parameter_phase(net, phase: str, inner_block_indices: tuple[int, ...] | None) -> None:
+        """Apply the optional single-GPU last-K phase freeze policy.
+
+        ``None`` deliberately leaves the established full-DiT bilevel path
+        unchanged.  A selected subset is configured before each full phase so
+        autograd does not retain parameter gradients for frozen early blocks.
+        """
+        if inner_block_indices is None:
+            if hasattr(net, "_bilevel_inner_block_indices"):
+                delattr(net, "_bilevel_inner_block_indices")
+            return
+
+        for parameter in net.parameters():
+            parameter.requires_grad_(False)
+        if phase == "inner":
+            for block_index in inner_block_indices:
+                net.blocks[block_index].requires_grad_(True)
+            net._bilevel_inner_block_indices = inner_block_indices
+        elif phase == "outer":
+            net.shared_token_linear.weight.requires_grad_(True)
+            # Outer loss must not traverse structured L21 at all.
+            net._bilevel_inner_block_indices = None
+        else:
+            raise ValueError(f"Unknown bilevel phase: {phase}")
+
+    @staticmethod
+    def configure_bilevel_last_k_ddp(trainer_config, model_config) -> bool:
+        """Resolve DDP settings required by the dynamic last-K phase graph.
+
+        This runs while the config is still mutable, before DDP construction.
+        It intentionally leaves ordinary training, full-DiT bilevel, and FSDP
+        configurations untouched.
+        """
+        is_last_k_no_fsdp_bilevel = (
+            trainer_config.enable_bilevel_training
+            and trainer_config.bilevel_inner_last_k_blocks is not None
+            and getattr(model_config, "fsdp_shard_size", 1) == 1
+        )
+        if is_last_k_no_fsdp_bilevel:
+            trainer_config.ddp.static_graph = False
+            trainer_config.ddp.find_unused_parameters = True
+        return is_last_k_no_fsdp_bilevel
+
     def _should_run_initial_validation(self, iteration: int) -> bool:
         return (
             self.config.trainer.run_validation
@@ -94,8 +152,19 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()
         if self.config.trainer.enable_bilevel_training:
+            inner_block_indices = self.bilevel_inner_block_indices(
+                model.net, self.config.trainer.bilevel_inner_last_k_blocks
+            )
+            if inner_block_indices is not None and getattr(model.config, "fsdp_shard_size", 1) > 1:
+                raise RuntimeError(
+                    "bilevel_inner_last_k_blocks currently requires fsdp_shard_size=1; "
+                    "the phase-specific requires_grad policy is intentionally single-GPU/no-FSDP only."
+                )
             inner_optimizer, outer_optimizer, inner_params, outer_params, inner_scheduler, outer_scheduler = model.init_bilevel_optimizers(
-                self.config.optimizer, self.config.scheduler, outer_lr=1e-5
+                self.config.optimizer,
+                self.config.scheduler,
+                outer_lr=1e-5,
+                inner_block_indices=inner_block_indices,
             )
             optimizer, scheduler = inner_optimizer, None
         else:
@@ -124,7 +193,8 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
                 self._train_bilevel(
                     model, dataloader_train, dataloader_val, inner_optimizer, outer_optimizer,
                     inner_scheduler, outer_scheduler, grad_scaler, bilevel_state, torch_profiler,
-                    memory_profiler, model_ddp=model_ddp,
+                    memory_profiler, model_ddp=model_ddp, inner_params=inner_params,
+                    outer_params=outer_params, inner_block_indices=inner_block_indices,
                 )
             self.callbacks.on_train_end(model, iteration=self._bilevel_global_step)
             self.checkpointer.finalize()
@@ -228,7 +298,7 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         distributed.barrier()
         self.callbacks.on_app_end()
 
-    def _train_bilevel(self, model, dataloader_train, dataloader_val, inner_optimizer, outer_optimizer, inner_scheduler, outer_scheduler, grad_scaler, state, torch_profiler=None, memory_profiler=None, model_ddp=None):
+    def _train_bilevel(self, model, dataloader_train, dataloader_val, inner_optimizer, outer_optimizer, inner_scheduler, outer_scheduler, grad_scaler, state, torch_profiler=None, memory_profiler=None, model_ddp=None, inner_params=None, outer_params=None, inner_block_indices=None):
         """First-order truncated alternating loop; each optimizer step accumulates N micro-batches."""
         if model_ddp is None:
             model_ddp = model
@@ -241,13 +311,21 @@ class CosmosPolicyTrainer(ImaginaireTrainer):
         global_step = state["global_optimizer_step"]
         last_saved_global_optimizer_step = None
         accum = self.config.trainer.grad_accum_iter
+        inner_param_list = [parameter for _, parameter in inner_params] if inner_params is not None else [
+            parameter
+            for name, parameter in model.net.named_parameters()
+            if not name.endswith("shared_token_linear.weight") and parameter.requires_grad
+        ]
+        outer_param_list = [parameter for _, parameter in outer_params] if outer_params is not None else [
+            parameter for name, parameter in model.net.named_parameters()
+            if name.endswith("shared_token_linear.weight")
+        ]
         while global_step < self.config.trainer.max_iter:
-            inner_param_list = [p for name, p in model.net.named_parameters() if not name.endswith("shared_token_linear.weight") and p.requires_grad]
-            outer_param_list = [p for name, p in model.net.named_parameters() if name.endswith("shared_token_linear.weight")]
             sequence = self.bilevel_phase_sequence(self.config.trainer.bilevel_inner_steps, self.config.trainer.bilevel_outer_steps)
             for phase in sequence[state["phase_step_in_cycle"]:]:
                 if global_step >= self.config.trainer.max_iter:
                     break
+                self.configure_bilevel_parameter_phase(model.net, phase, inner_block_indices)
                 optimizer, params = (inner_optimizer, inner_param_list) if phase == "inner" else (outer_optimizer, outer_param_list)
                 inner_optimizer.zero_grad(set_to_none=True); outer_optimizer.zero_grad(set_to_none=True)
                 model._bilevel_phase = phase

@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.distributed as dist
 
 from cosmos_policy._src.predict2.utils.optim_instantiate import get_regular_param_group
 from cosmos_policy._src.predict2.networks.minimal_v4_dit import (
@@ -73,6 +74,36 @@ def test_shared_token_linear_architecture_parameter_receives_gradient():
     assert tokens.grad.abs().max() > 0
 
 
+def test_shared_token_linear_dtensor_identity_reset():
+    pytest.importorskip("torch.distributed.tensor")
+    from torch.distributed._tensor import Replicate, distribute_tensor, init_device_mesh
+
+    if dist.is_initialized():
+        pytest.skip("test process already owns a distributed group")
+    import os
+    import tempfile
+
+    fd, rendezvous = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        dist.init_process_group(
+            backend="gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1
+        )
+        try:
+            mesh = init_device_mesh("cpu", (1,))
+            linear = SharedTokenLinear(8)
+            linear.weight = torch.nn.Parameter(
+                distribute_tensor(torch.zeros(8, 8), mesh, [Replicate()])
+            )
+            linear.reset_parameters()
+            full = linear.weight.full_tensor()
+            torch.testing.assert_close(full, torch.eye(8))
+            assert str(type(linear.weight).__name__) == "DTensor"
+        finally:
+            dist.destroy_process_group()
+    finally:
+        if os.path.exists(rendezvous):
+            os.unlink(rendezvous)
 @pytest.mark.parametrize("freeze_shared_token_linear", [False, True])
 def test_shared_token_linear_optimizer_membership_is_config_controlled(freeze_shared_token_linear):
     model = _tiny_dit(freeze_shared_token_linear=freeze_shared_token_linear)

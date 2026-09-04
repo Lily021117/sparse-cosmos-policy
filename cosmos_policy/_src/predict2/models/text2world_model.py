@@ -230,6 +230,7 @@ class DiffusionModel(ImaginaireModel):
                 # IMPORTANT: (qsh) model init should not depends on current tensor shape, or it can handle Dtensor shape.
                 net.init_weights()
 
+
             if self.fsdp_device_mesh:
                 broadcast_dtensor_model_states(net, self.fsdp_device_mesh)
                 for name, param in net.named_parameters():
@@ -292,6 +293,58 @@ class DiffusionModel(ImaginaireModel):
         optimizer = lazy_instantiate(optimizer_config, model=self.net)
         scheduler = get_base_scheduler(optimizer, self, scheduler_config)
         return optimizer, scheduler
+
+    @staticmethod
+    def _bilevel_named_parameter_sets(net, inner_block_indices=None):
+        """Return disjoint DiT-inner and shared-projection outer parameters."""
+        named = list(net.named_parameters())
+        outer = [(name, parameter) for name, parameter in named if name.endswith("shared_token_linear.weight")]
+        if inner_block_indices is None:
+            inner = [
+                (name, parameter)
+                for name, parameter in named
+                if not name.endswith("shared_token_linear.weight") and parameter.requires_grad
+            ]
+        else:
+            prefixes = tuple(f"blocks.{index}." for index in inner_block_indices)
+            inner = [
+                (name, parameter)
+                for name, parameter in named
+                if name.startswith(prefixes)
+            ]
+        return inner, outer
+
+    def init_bilevel_optimizers(
+        self,
+        optimizer_config: LazyDict,
+        scheduler_config: LazyDict,
+        outer_lr: float = 1e-5,
+        inner_block_indices=None,
+    ):
+        """Create disjoint inner (DiT) and outer (SharedTokenLinear) optimizers."""
+        from copy import deepcopy
+
+        class _ParameterView:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def named_parameters(self):
+                return iter(self._items)
+
+        inner, outer = self._bilevel_named_parameter_sets(self.net, inner_block_indices)
+        if len(outer) != 1 or not outer[0][1].requires_grad:
+            raise AssertionError("Bilevel mode requires one trainable SharedTokenLinear weight")
+        if not inner:
+            raise AssertionError("Bilevel mode requires at least one inner parameter")
+        if {id(p) for _, p in inner} & {id(p) for _, p in outer}:
+            raise AssertionError("Inner/outer parameter sets overlap")
+        inner_opt = lazy_instantiate(optimizer_config, model=_ParameterView(inner))
+        outer_cfg = deepcopy(optimizer_config)
+        outer_cfg["lr"] = outer_lr
+        outer_opt = lazy_instantiate(outer_cfg, model=_ParameterView(outer))
+        inner_sched = get_base_scheduler(inner_opt, self, scheduler_config)
+        outer_sched = torch.optim.lr_scheduler.LambdaLR(outer_opt, lr_lambda=lambda _: 1.0)
+        return inner_opt, outer_opt, inner, outer, inner_sched, outer_sched
 
     # ------------------------ training hooks ------------------------
     def on_before_zero_grad(

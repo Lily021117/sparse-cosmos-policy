@@ -398,6 +398,10 @@ class TrainerConfig:
     enable_bilevel_training: bool = False
     bilevel_inner_steps: int = 5
     bilevel_outer_steps: int = 1
+    # ``None`` trains the full DiT in the inner phase. A positive value trains
+    # only the final K DiT blocks, while the outer phase still trains the
+    # shared token projection alone.
+    bilevel_inner_last_k_blocks: int | None = None
     # Straggler Detection config
     straggler_detection: StragglerDetectionConfig = attrs.field(factory=StragglerDetectionConfig)
     # Profiling config

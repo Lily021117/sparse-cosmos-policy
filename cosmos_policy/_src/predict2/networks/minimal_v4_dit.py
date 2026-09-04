@@ -236,7 +236,7 @@ class RMSNorm(torch.nn.Module):
 
 # ---------------------- Feed Forward Network -----------------------
 class GPT2FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_ff: int):
+    def __init__(self, d_model: int, d_ff: int, mlp_token_chunks: int = 1):
         super().__init__()
         self.activation = nn.GELU()
         self.layer1 = nn.Linear(d_model, d_ff, bias=False)
@@ -245,6 +245,9 @@ class GPT2FeedForward(nn.Module):
         self._layer_id = None
         self._dim = d_model
         self._hidden_dim = d_ff
+        if mlp_token_chunks < 1:
+            raise ValueError("mlp_token_chunks must be >= 1")
+        self.mlp_token_chunks = mlp_token_chunks
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -258,6 +261,12 @@ class GPT2FeedForward(nn.Module):
         torch.nn.init.trunc_normal_(self.layer2.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor):
+        original_shape = x.shape
+        if self.mlp_token_chunks > 1:
+            x = x.reshape(x.shape[0], -1, x.shape[-1])
+            chunks = x.chunk(self.mlp_token_chunks, dim=1)
+            outputs = [self.layer2(self.activation(self.layer1(chunk))) for chunk in chunks]
+            return torch.cat(outputs, dim=1).reshape(original_shape)
         x = self.layer1(x)
 
         x = self.activation(x)
@@ -1059,7 +1068,36 @@ class SharedTokenLinear(nn.Linear):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            self.weight.copy_(torch.eye(self.out_features, device=self.weight.device, dtype=self.weight.dtype))
+            # FSDP2 may have materialized this parameter as a DTensor before
+            # ``init_weights`` calls reset_parameters.  The source and target
+            # of copy_ must then have matching DTensor layouts.
+            try:
+                from torch.distributed.tensor import DTensor, distribute_tensor
+            except ImportError:  # pragma: no cover - older PyTorch
+                DTensor = ()
+                distribute_tensor = None
+            if DTensor and isinstance(self.weight, DTensor):
+                identity = torch.eye(
+                    self.out_features,
+                    self.in_features,
+                    dtype=self.weight.dtype,
+                    device=self.weight.device,
+                )
+                identity = distribute_tensor(
+                    identity,
+                    device_mesh=self.weight.device_mesh,
+                    placements=self.weight.placements,
+                )
+                self.weight.copy_(identity)
+            else:
+                self.weight.copy_(
+                    torch.eye(
+                        self.out_features,
+                        self.in_features,
+                        device=self.weight.device,
+                        dtype=self.weight.dtype,
+                    )
+                )
 
 
 class FinalLayer(nn.Module):

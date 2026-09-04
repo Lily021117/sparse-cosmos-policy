@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Sequence
 
 import torch
 from torch import nn
@@ -149,11 +149,17 @@ class StructuredL21Regularizer:
     def _mlp_group_norms(cls, block: nn.Module) -> torch.Tensor:
         return cls._column_norm(block.mlp.layer1.weight)
 
-    def __call__(self, model: nn.Module) -> StructuredL21Result:
+    def __call__(
+        self, model: nn.Module, *, block_indices: Sequence[int] | None = None
+    ) -> StructuredL21Result:
         if not self.enabled:
             raise RuntimeError("At least one structured L21 component must be enabled")
 
-        blocks = list(self._dit_blocks(model))
+        if block_indices is None:
+            blocks = list(self._dit_blocks(model))
+        else:
+            # Avoid traversing or regularizing unselected DiT blocks.
+            blocks = [model.blocks[index] for index in block_indices]
         if not blocks:
             raise ValueError("Could not find DiT blocks with self_attn, cross_attn, and mlp modules")
 
@@ -248,6 +254,7 @@ def apply_structured_l21(
     *,
     component_lambdas: Mapping[str, float] | None = None,
     collect_diagnostics: bool = False,
+    block_indices: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Integrate L2,1 with a task loss, avoiding baseline weight scans.
 
@@ -274,11 +281,23 @@ def apply_structured_l21(
         return task_loss, {}
 
     if any(value > 0 for value in enabled_lambdas.values()):
-        result = regularizer(model)
+        # Preserve the original call shape for the full-model path.  In
+        # particular, this keeps existing diagnostic hooks that wrap the
+        # regularizer compatible while the last-K bilevel path opts in to the
+        # explicit block subset.
+        result = (
+            regularizer(model)
+            if block_indices is None
+            else regularizer(model, block_indices=block_indices)
+        )
         total_loss = add_structured_l21_penalty(task_loss, result, component_lambdas=enabled_lambdas)
     else:
         with torch.no_grad():
-            result = regularizer(model)
+            result = (
+                regularizer(model)
+                if block_indices is None
+                else regularizer(model, block_indices=block_indices)
+            )
         total_loss = task_loss
 
     return total_loss, result.detached_metrics()
@@ -292,6 +311,7 @@ def apply_structured_l21_for_phase(
     phase: str,
     component_lambdas: Mapping[str, float],
     collect_diagnostics: bool = False,
+    block_indices: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Build the inner or outer objective without another model forward."""
     if phase == "outer":
@@ -304,4 +324,5 @@ def apply_structured_l21_for_phase(
         regularizer,
         component_lambdas=component_lambdas,
         collect_diagnostics=collect_diagnostics,
+        block_indices=block_indices,
     )

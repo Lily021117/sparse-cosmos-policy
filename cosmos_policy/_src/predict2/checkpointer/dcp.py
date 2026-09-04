@@ -80,6 +80,7 @@ from cosmos_policy._src.imaginaire.config import CheckpointConfig, JobConfig
 from cosmos_policy._src.imaginaire.model import ImaginaireModel
 from cosmos_policy._src.imaginaire.utils import callback, distributed, log, misc
 from cosmos_policy._src.imaginaire.utils.easy_io import easy_io
+from cosmos_policy._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
 try:
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner as _DefaultLoadPlanner
@@ -492,7 +493,7 @@ class DistributedCheckpointer(AbstractCheckpointer):
         else:
             if self.load_path and not str(self.load_path).endswith(".pt"):
                 # 2. Load the module weights specified by config_checkpoint.path.
-                checkpoint_path = self.load_path
+                checkpoint_path = get_checkpoint_path(self.load_path)
                 if self.load_s3_backend_key:
                     checkpoint_path = f"s3://{self.config_checkpoint.load_from_object_store.bucket}/{checkpoint_path}"
                     if not re.search(r"/checkpoints/iter_\d{9}/?$", checkpoint_path):

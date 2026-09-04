@@ -182,6 +182,9 @@ class CosmosPolicyModelConfig(BaseText2WorldModelConfig):
     Also adds policy-specific parameters for loss masking and action prediction.
     """
 
+    # Optional initial consolidated checkpoint; distinct from DCP resume state.
+    pretrained_checkpoint_path: Optional[str] = None
+
     sde: LazyDict = L(HybridEDMSDE)(
         # Note: Most of these values get overridden later in the experiment configs
         p_mean=0.0,
@@ -291,6 +294,11 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
         self, raw_task_loss: torch.Tensor, phase: str
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Build the phase objective without recomputing the task forward."""
+        block_indices = (
+            getattr(self.net, "_bilevel_inner_block_indices", None)
+            if phase == "inner"
+            else None
+        )
         return apply_structured_l21_for_phase(
             raw_task_loss,
             self.net,
@@ -298,6 +306,7 @@ class CosmosPolicyDiffusionModel(BaseDiffusionModel):
             phase=phase,
             component_lambdas=self._structured_l21_component_lambdas(),
             collect_diagnostics=self.config.structured_l21_diagnostic_metrics,
+            block_indices=block_indices,
         )
 
     def training_step(

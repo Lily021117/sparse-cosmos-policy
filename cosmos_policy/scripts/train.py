@@ -33,6 +33,7 @@ from cosmos_policy._src.imaginaire.lazy_config import LazyConfig, instantiate
 from cosmos_policy._src.imaginaire.serialization import to_yaml
 from cosmos_policy._src.imaginaire.utils import distributed
 from cosmos_policy._src.imaginaire.utils.context_managers import data_loader_init, distributed_init, model_init
+from cosmos_policy._src.predict2.utils.model_loader import load_model_state_dict_from_checkpoint
 from cosmos_policy._src.imaginaire.utils.launch import log_reproducible_setup
 
 
@@ -54,6 +55,11 @@ def launch(config: Config, args: argparse.Namespace) -> None:
 
     with model_init():
         model = instantiate(config.model)
+        pretrained_path = getattr(model.config, "pretrained_checkpoint_path", None)
+        if pretrained_path and not config.checkpoint.load_path:
+            if getattr(model.config, "fsdp_shard_size", 1) > 1:
+                raise RuntimeError("consolidated pretrained initialization through this path currently supports no-FSDP only")
+            model = load_model_state_dict_from_checkpoint(model, config, pretrained_path)
 
     # Create the dataloaders.
     with data_loader_init():
